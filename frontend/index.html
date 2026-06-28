@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wedding·lifeboat — score &amp; pdf tools</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>🎵</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { background: #cfc3a8; }
+  @keyframes wl-spin { to { transform: rotate(360deg); } }
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-thumb { background: var(--line, #d8ccb0); border-radius: 6px; border: 3px solid transparent; background-clip: content-box; }
+  button { font-family: inherit; }
+  select { outline: none; }
+</style>
+</head>
+<body>
+<div id="app" style="display:flex;min-height:100vh;height:100vh;font-family:'Hanken Grotesk',system-ui,sans-serif;background:var(--bg,#efe6d2);color:var(--ink,#2c2318);background-image:radial-gradient(rgba(120,90,50,0.045) 1px, transparent 1px);background-size:4px 4px;"></div>
+
+<script>
+"use strict";
+const API = ""; // same-origin (served by FastAPI). Set to "http://localhost:8000" if opening the file directly.
+
+// ---------------------------------------------------------------- constants
+const PALETTES = {
+  parchment: { bg:'#efe6d2', panel:'#f7f1e3', panel2:'#e7dcc4', ink:'#2c2318', inkSoft:'#7a6c56', line:'#d8ccb0', accent:'#b5532a', accentInk:'#fdf6ea', shadow:'0 2px 12px rgba(80,55,25,0.13)' },
+  sepia:     { bg:'#e7d8bf', panel:'#f1e4cd', panel2:'#dcc9a8', ink:'#3a2a18', inkSoft:'#876e4e', line:'#cdb893', accent:'#985a1f', accentInk:'#f6ecd9', shadow:'0 2px 12px rgba(90,60,25,0.16)' },
+  slate:     { bg:'#211f1c', panel:'#2b2825', panel2:'#35312c', ink:'#ece3d3', inkSoft:'#9c9384', line:'#423d36', accent:'#cf7a48', accentInk:'#1c1916', shadow:'0 3px 16px rgba(0,0,0,0.4)' },
+};
+const PALETTE_LIST = [
+  { key:'parchment', label:'Parchment', dot:'#b5532a' },
+  { key:'sepia', label:'Sepia', dot:'#985a1f' },
+  { key:'slate', label:'Slate', dot:'#cf7a48' },
+];
+const PART_COLORS = ['#b5532a','#bf8a2e','#5d7a4f','#3f5e78','#6d5080'];
+const ENSEMBLES = [
+  { key:'quartet', label:'String Quartet', parts:['Violin I','Violin II','Viola','Cello'] },
+  { key:'trio',    label:'String Trio',    parts:['Violin','Viola','Cello'] },
+  { key:'duo',     label:'Duo',            parts:['Part 1','Part 2'] },
+  { key:'quintet', label:'String Quintet', parts:['Violin I','Violin II','Viola','Cello 1','Cello 2'] },
+];
+const HEADS = {
+  score: { title:'Score Extraction', subtitle:'Split a stacked full score into one clean PDF per instrument. Detection is automatic — confirm or fine-tune the crop regions, then export.' },
+  img:   { title:'Images → PDF', subtitle:'Combine PNG and JPEG images into a single PDF, one image per page, in the order you arrange them.' },
+  pdf:   { title:'Merge PDFs', subtitle:'Stitch multiple PDF files together into one document in your chosen order.' },
+};
+const NAV = [
+  { key:'score', label:'Score Extraction', desc:'Split a full score into parts' },
+  { key:'img',   label:'Images → PDF',     desc:'Combine images into a PDF' },
+  { key:'pdf',   label:'Merge PDFs',       desc:'Join PDFs into one' },
+];
+
+// ---------------------------------------------------------------- state
+const state = {
+  tool: 'score',
+  palette: 'parchment',
+  engine: 'wait',                 // 'wait' | 'ready' | 'off'
+  ensembleKey: 'quartet',
+  score: { name:'', file:null, pages:[], busy:false, outputs:[], warnings:[] },
+  img:   { items:[], pageSize:'fit-a4', busy:false, output:null },
+  pdf:   { items:[], busy:false, output:null },
+};
+function parts() { return (ENSEMBLES.find(e => e.key === state.ensembleKey) || ENSEMBLES[0]).parts; }
+
+// ---------------------------------------------------------------- tiny DOM helper
+function E(tag, opts, kids) {
+  const e = document.createElement(tag);
+  opts = opts || {};
+  if (opts.css) e.style.cssText = opts.css;
+  if (opts.style) Object.assign(e.style, opts.style);
+  if (opts.cls) e.className = opts.cls;
+  if (opts.text != null) e.textContent = opts.text;
+  if (opts.html != null) e.innerHTML = opts.html;
+  if (opts.attrs) for (const k in opts.attrs) e.setAttribute(k, opts.attrs[k]);
+  if (opts.on) for (const k in opts.on) e.addEventListener(k, opts.on[k]);
+  (Array.isArray(kids) ? kids : kids != null ? [kids] : []).forEach(k => {
+    if (k == null) return;
+    e.appendChild(typeof k === 'string' ? document.createTextNode(k) : k);
+  });
+  return e;
+}
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const uid = () => Math.random().toString(36).slice(2, 9);
+function hexA(hex, a) {
+  const h = hex.replace('#', '');
+  return 'rgba(' + parseInt(h.slice(0,2),16) + ',' + parseInt(h.slice(2,4),16) + ',' + parseInt(h.slice(4,6),16) + ',' + a + ')';
+}
+function readDataUrl(file) {
+  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+}
+function downloadName(dataUrl, filename) {
+  const a = document.createElement('a'); a.href = dataUrl; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// ---------------------------------------------------------------- theme
+function applyTheme() {
+  const p = PALETTES[state.palette] || PALETTES.parchment;
+  const r = document.getElementById('app');
+  r.style.setProperty('--bg', p.bg); r.style.setProperty('--panel', p.panel);
+  r.style.setProperty('--panel-2', p.panel2); r.style.setProperty('--ink', p.ink);
+  r.style.setProperty('--ink-soft', p.inkSoft); r.style.setProperty('--line', p.line);
+  r.style.setProperty('--accent', p.accent); r.style.setProperty('--accent-ink', p.accentInk);
+  r.style.setProperty('--shadow', p.shadow);
+}
+
+// ---------------------------------------------------------------- shared styles
+const primaryBtn = (disabled) =>
+  'display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border:none;border-radius:8px;' +
+  'background:' + (disabled ? 'var(--line,#d8ccb0)' : 'var(--accent,#b5532a)') + ';' +
+  'color:' + (disabled ? 'var(--ink-soft,#7a6c56)' : 'var(--accent-ink,#fdf6ea)') + ';' +
+  "font:600 14px 'Hanken Grotesk',sans-serif;cursor:" + (disabled ? 'default' : 'pointer') + ';';
+const ghostBtn =
+  "padding:9px 15px;border:1px solid var(--line,#d8ccb0);border-radius:7px;background:transparent;color:var(--ink,#2c2318);font:600 13px 'Hanken Grotesk',sans-serif;cursor:pointer;";
+const selectCss =
+  "appearance:none;padding:8px 30px 8px 12px;border:1px solid var(--line,#d8ccb0);border-radius:7px;background:var(--bg,#efe6d2);color:var(--ink,#2c2318);font:500 13px 'Hanken Grotesk',sans-serif;cursor:pointer;";
+const labelCapCss = "font-size:11px;text-transform:uppercase;letter-spacing:0.14em;color:var(--ink-soft,#7a6c56);";
+function spinner(show) {
+  return E('span', { css: show
+    ? "width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;display:inline-block;animation:wl-spin .7s linear infinite;"
+    : "display:none;" });
+}
+const dropZoneCss =
+  "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;min-height:160px;border:2px dashed var(--line,#d8ccb0);border-radius:14px;background:var(--panel,#f7f1e3);cursor:pointer;text-align:center;padding:28px;";
+
+// ================================================================ RENDER
+function render() {
+  const app = document.getElementById('app');
+  app.innerHTML = '';
+  app.appendChild(renderSidebar());
+  app.appendChild(renderMain());
+  applyTheme();
+}
+
+function renderSidebar() {
+  const logo = E('div', { css: "padding:0 6px 22px;" }, [
+    E('div', { css: "font-family:'Spectral',serif;font-weight:600;font-size:23px;letter-spacing:-0.01em;line-height:1.05;",
+      html: 'wedding<span style="color:var(--accent,#b5532a);">·</span>lifeboat' }),
+    E('div', { css: "font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:var(--ink-soft,#7a6c56);margin-top:7px;", text: 'score & pdf tools' }),
+  ]);
+
+  const navBtns = NAV.map(n => {
+    const active = state.tool === n.key;
+    const bar = E('span', { css: "position:absolute;left:0;top:18%;bottom:18%;width:3px;border-radius:3px;",
+      style: { background: active ? 'var(--accent,#b5532a)' : 'transparent' } });
+    const txt = E('span', { css: "display:flex;flex-direction:column;gap:2px;text-align:left;" }, [
+      E('span', { css: "font-weight:600;font-size:14px;", text: n.label }),
+      E('span', { css: "font-size:11.5px;color:var(--ink-soft,#7a6c56);font-weight:400;", text: n.desc }),
+    ]);
+    return E('button', {
+      css: "position:relative;display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:9px;border:none;cursor:pointer;width:100%;color:var(--ink,#2c2318);",
+      style: { background: active ? 'var(--panel-2,#e7dcc4)' : 'transparent' },
+      on: { click: () => { state.tool = n.key; render(); } },
+    }, [bar, txt]);
+  });
+
+  const swatches = PALETTE_LIST.map(p => E('button', {
+    attrs: { title: p.label },
+    style: {
+      width: '44px', height: '32px', borderRadius: '8px', cursor: 'pointer',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      background: 'var(--panel-2,#e7dcc4)',
+      border: state.palette === p.key ? '2px solid var(--accent,#b5532a)' : '1px solid var(--line,#d8ccb0)',
+    },
+    on: { click: () => { state.palette = p.key; render(); } },
+  }, E('span', { style: { width: '16px', height: '16px', borderRadius: '50%', background: p.dot } })));
+
+  const engineReady = state.engine === 'ready';
+  const engineDot = E('span', { style: { width: '8px', height: '8px', borderRadius: '50%', display: 'inline-block',
+    background: engineReady ? '#5d7a4f' : (state.engine === 'off' ? '#b5532a' : '#bf8a2e') } });
+  const engineLabel = engineReady ? 'Engine ready' : (state.engine === 'off' ? 'Engine offline' : 'Connecting…');
+
+  const appearance = E('div', { css: "margin-top:auto;padding-top:20px;border-top:1px solid var(--line,#d8ccb0);" }, [
+    E('div', { css: "font-size:11px;text-transform:uppercase;letter-spacing:0.16em;color:var(--ink-soft,#7a6c56);margin:0 6px 12px;", text: 'Appearance' }),
+    E('div', { css: "display:flex;gap:8px;padding:0 4px;" }, swatches),
+    E('div', { css: "font-size:11px;color:var(--ink-soft,#7a6c56);margin:14px 6px 0;display:flex;align-items:center;gap:7px;" }, [engineDot, engineLabel]),
+  ]);
+
+  return E('aside', {
+    css: "width:248px;flex:none;display:flex;flex-direction:column;background:var(--panel,#f7f1e3);border-right:1px solid var(--line,#d8ccb0);padding:26px 18px;gap:6px;",
+  }, [logo, ...navBtns, appearance]);
+}
+
+function renderMain() {
+  const head = HEADS[state.tool];
+  const header = E('header', {
+    css: "padding:26px 40px 20px;border-bottom:1px solid var(--line,#d8ccb0);background:var(--bg,#efe6d2);",
+  }, [
+    E('h1', { css: "margin:0;font-family:'Spectral',serif;font-weight:600;font-size:28px;letter-spacing:-0.015em;", text: head.title }),
+    E('p', { css: "margin:6px 0 0;font-size:14px;color:var(--ink-soft,#7a6c56);max-width:640px;", text: head.subtitle }),
+  ]);
+  let body;
+  if (state.tool === 'score') body = renderScore();
+  else if (state.tool === 'img') body = renderImg();
+  else body = renderPdf();
+
+  const scroll = E('div', { css: "flex:1;overflow:auto;padding:32px 40px 64px;" }, body);
+  return E('main', { css: "flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;" }, [header, scroll]);
+}
+
+// ================================================================ SCORE
+function renderScore() {
+  const sc = state.score;
+  if (!sc.pages.length && !sc.busy) {
+    const input = E('input', { attrs: { type: 'file', accept: 'application/pdf' }, css: "display:none;",
+      on: { change: (e) => { const f = e.target.files[0]; if (f) handleScoreFile(f); } } });
+    return E('label', {
+      css: "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;min-height:340px;border:2px dashed var(--line,#d8ccb0);border-radius:16px;background:var(--panel,#f7f1e3);cursor:pointer;text-align:center;padding:40px;",
+      on: { drop: (e) => { e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleScoreFile(f); }, dragover: (e) => e.preventDefault() },
+    }, [
+      input,
+      E('div', { css: "width:60px;height:60px;border-radius:14px;background:var(--panel-2,#e7dcc4);display:flex;align-items:center;justify-content:center;font-family:'Spectral',serif;font-size:30px;color:var(--accent,#b5532a);", text: '♪' }),
+      E('div', { css: "font-family:'Spectral',serif;font-size:21px;", text: 'Drop a full score PDF here' }),
+      E('div', { css: "font-size:13.5px;color:var(--ink-soft,#7a6c56);max-width:420px;line-height:1.5;", text: "Upload a stacked-system score (e.g. a string quartet). We'll detect each system and split it into one PDF per instrument. You confirm or adjust the crop regions before exporting." }),
+      E('span', { css: "margin-top:6px;display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:8px;background:var(--accent,#b5532a);color:var(--accent-ink,#fdf6ea);font-weight:600;font-size:14px;", text: 'Choose PDF' }),
+    ]);
+  }
+
+  // control bar
+  const ensembleSel = E('select', { css: selectCss, on: { change: (e) => { state.ensembleKey = e.target.value; redetect(); } } },
+    ENSEMBLES.map(en => E('option', { attrs: Object.assign({ value: en.key }, en.key === state.ensembleKey ? { selected: 'selected' } : {}), text: en.label })));
+  const extractDisabled = sc.busy || !sc.pages.length;
+  const extractBtn = E('button', { css: primaryBtn(extractDisabled), attrs: extractDisabled ? { disabled: 'true' } : {},
+    on: { click: () => { if (!extractDisabled) extractParts(); } } }, [spinner(sc.busy), sc.busy ? 'Working…' : 'Extract parts']);
+
+  const controlBar = E('div', {
+    css: "display:flex;flex-wrap:wrap;align-items:center;gap:14px;padding:16px 18px;background:var(--panel,#f7f1e3);border:1px solid var(--line,#d8ccb0);border-radius:12px;",
+  }, [
+    E('div', { css: "display:flex;flex-direction:column;gap:3px;min-width:0;" }, [
+      E('span', { css: labelCapCss, text: 'Loaded score' }),
+      E('span', { css: "font-family:'Spectral',serif;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px;", text: sc.name }),
+    ]),
+    E('div', { css: "display:flex;flex-direction:column;gap:3px;" }, [
+      E('span', { css: labelCapCss, text: 'Ensemble' }), ensembleSel,
+    ]),
+    E('div', { css: "flex:1;" }),
+    E('button', { css: ghostBtn, on: { click: redetect }, text: 'Re-detect' }),
+    E('button', { css: ghostBtn, on: { click: clearScore }, text: 'Clear' }),
+    extractBtn,
+  ]);
+
+  // legend
+  const legend = E('div', { css: "display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:13px;color:var(--ink-soft,#7a6c56);" }, [
+    E('span', { text: 'Parts:' }),
+    ...parts().map((name, i) => E('span', { css: "display:inline-flex;align-items:center;gap:7px;" }, [
+      E('span', { style: { width: '13px', height: '13px', borderRadius: '3px', background: PART_COLORS[i % PART_COLORS.length] } }),
+      E('span', { css: "color:var(--ink,#2c2318);font-weight:500;", text: name }),
+    ])),
+    E('span', { css: "margin-left:6px;font-style:italic;", text: '— drag the edges & dividers to adjust each crop.' }),
+  ]);
+
+  const kids = [controlBar, legend];
+
+  // warnings
+  if (sc.warnings && sc.warnings.length) {
+    kids.push(E('div', { css: "padding:12px 16px;background:var(--panel,#f7f1e3);border:1px solid var(--accent,#b5532a);border-radius:10px;font-size:13px;color:var(--ink,#2c2318);display:flex;flex-direction:column;gap:4px;" },
+      [E('span', { css: "font-weight:600;", text: 'Heads up' }), ...sc.warnings.map(w => E('span', { css: "color:var(--ink-soft,#7a6c56);", text: '• ' + w }))]));
+  }
+
+  // outputs
+  if (sc.outputs.length) {
+    kids.push(E('div', {
+      css: "display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:16px 18px;background:var(--panel,#f7f1e3);border:1px solid var(--accent,#b5532a);border-radius:12px;",
+    }, [
+      E('span', { css: "font-family:'Spectral',serif;font-size:15px;", text: '✓ Parts ready' }),
+      ...sc.outputs.map(o => {
+        const a = E('a', { attrs: { href: o.dataUrl, download: o.filename },
+          css: "display:inline-flex;align-items:center;gap:7px;padding:9px 15px;border-radius:7px;background:var(--bg,#efe6d2);border:1px solid var(--line,#d8ccb0);color:var(--ink,#2c2318);text-decoration:none;font-weight:600;font-size:13px;" },
+          [E('span', { style: { width: '11px', height: '11px', borderRadius: '3px', background: o.color } }), o.name + ' ↓']);
+        return a;
+      }),
+    ]));
+  }
+
+  // pages
+  const pagesWrap = E('div', { css: "display:flex;flex-direction:column;gap:26px;align-items:center;" });
+  if (sc.busy && !sc.pages.length) {
+    pagesWrap.appendChild(E('div', { css: "padding:60px;color:var(--ink-soft,#7a6c56);display:flex;align-items:center;gap:12px;" },
+      [spinner(true), 'Detecting systems…']));
+  }
+  sc.pages.forEach((pg, pi) => pagesWrap.appendChild(buildPageBlock(pg, pi)));
+  kids.push(pagesWrap);
+
+  return E('div', { css: "display:flex;flex-direction:column;gap:20px;" }, kids);
+}
+
+const _frames = {}; // pi -> frame element (kept so the preview image isn't reloaded mid-drag)
+
+function buildPageBlock(pg, pi) {
+  const headRow = E('div', { css: "display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;" }, [
+    E('span', { css: labelCapCss, text: 'Page ' + pg.num }),
+    E('button', { css: "padding:6px 12px;border:1px solid var(--line,#d8ccb0);border-radius:6px;background:transparent;color:var(--ink,#2c2318);font:600 12px 'Hanken Grotesk',sans-serif;cursor:pointer;",
+      on: { click: () => addSystem(pi) }, text: '+ Add system' }),
+  ]);
+  const frame = E('div', {
+    style: {
+      position: 'relative', width: '100%', paddingTop: (pg.h / pg.w * 100) + '%',
+      backgroundImage: 'url(' + pg.preview + ')', backgroundSize: '100% 100%', backgroundColor: '#fff',
+      boxShadow: 'var(--shadow,0 2px 10px rgba(60,40,20,0.12))', borderRadius: '4px', overflow: 'hidden',
+    },
+  });
+  _frames[pi] = frame;
+  renderOverlays(pi);
+  return E('div', { css: "width:100%;max-width:920px;" }, [headRow, frame]);
+}
+
+function renderOverlays(pi) {
+  const frame = _frames[pi];
+  if (!frame) return;
+  frame.innerHTML = '';
+  const sc = state.score;
+  const pg = sc.pages[pi];
+  const P = parts();
+  pg.systems.forEach((sys, si) => {
+    const pct = (v) => (v * 100) + '%';
+    // band outline
+    frame.appendChild(E('div', { style: {
+      position: 'absolute', left: pct(sys.x0), top: pct(sys.y0),
+      width: pct(sys.x1 - sys.x0), height: pct(sys.y1 - sys.y0),
+      border: '1.5px solid rgba(60,40,20,0.55)', borderRadius: '2px', pointerEvents: 'none',
+      boxShadow: '0 0 0 9999px rgba(40,30,15,0.03)',
+    } }));
+    // part sub-bands
+    const bounds = [sys.y0, ...sys.dividers, sys.y1];
+    P.forEach((pname, k) => {
+      const t = bounds[k], b = bounds[k + 1];
+      if (t == null || b == null) return;
+      const pc = PART_COLORS[k % PART_COLORS.length];
+      const label = E('span', { style: {
+        position: 'absolute', left: '5px', top: '4px', padding: '2px 7px', borderRadius: '4px',
+        background: pc, color: '#fff', fontSize: '10.5px', fontWeight: 700, lineHeight: 1.3, whiteSpace: 'nowrap',
+        fontFamily: "'Hanken Grotesk',sans-serif",
+      }, text: pname });
+      frame.appendChild(E('div', { style: {
+        position: 'absolute', left: pct(sys.x0), top: pct(t),
+        width: pct(sys.x1 - sys.x0), height: pct(b - t),
+        background: hexA(pc, 0.13), borderTop: k === 0 ? 'none' : '1px dashed ' + pc, pointerEvents: 'none',
+      } }, label));
+    });
+    // edge handles
+    const hbar = (top) => ({ position: 'absolute', left: pct(sys.x0), width: pct(sys.x1 - sys.x0),
+      top: pct(top), height: '12px', transform: 'translateY(-50%)', cursor: 'row-resize', background: 'transparent', zIndex: 4 });
+    const vbar = (left) => ({ position: 'absolute', top: pct(sys.y0), height: pct(sys.y1 - sys.y0),
+      left: pct(left), width: '12px', transform: 'translateX(-50%)', cursor: 'col-resize', background: 'transparent', zIndex: 4 });
+    const edge = '2px solid rgba(60,40,20,0.7)';
+    frame.appendChild(E('div', { style: Object.assign(hbar(sys.y0), { borderTop: edge }), on: { pointerdown: dragStart(pi, si, 'top') } }));
+    frame.appendChild(E('div', { style: Object.assign(hbar(sys.y1), { borderBottom: edge }), on: { pointerdown: dragStart(pi, si, 'bottom') } }));
+    frame.appendChild(E('div', { style: Object.assign(vbar(sys.x0), { borderLeft: edge }), on: { pointerdown: dragStart(pi, si, 'left') } }));
+    frame.appendChild(E('div', { style: Object.assign(vbar(sys.x1), { borderRight: edge }), on: { pointerdown: dragStart(pi, si, 'right') } }));
+    // dividers
+    sys.dividers.forEach((dy, di) => {
+      frame.appendChild(E('div', { style: Object.assign(hbar(dy), { borderTop: '2px dashed ' + PART_COLORS[(di + 1) % PART_COLORS.length] }),
+        on: { pointerdown: dragStart(pi, si, 'div', di) } }));
+    });
+    // delete
+    frame.appendChild(E('button', { style: {
+      position: 'absolute', left: 'calc(' + pct(sys.x1) + ' - 26px)', top: 'calc(' + pct(sys.y0) + ' + 4px)',
+      width: '22px', height: '22px', borderRadius: '50%', border: 'none', cursor: 'pointer',
+      background: 'rgba(60,40,20,0.78)', color: '#fff', fontSize: '15px', lineHeight: 1, zIndex: 5,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+    }, on: { click: () => deleteSystem(pi, si) }, text: '×' }));
+  });
+}
+
+function dragStart(pi, si, kind, di) {
+  return (e) => {
+    e.preventDefault(); e.stopPropagation();
+    const frame = _frames[pi];
+    const rect = frame.getBoundingClientRect();
+    const move = (ev) => {
+      const nx = clamp((ev.clientX - rect.left) / rect.width, 0, 1);
+      const ny = clamp((ev.clientY - rect.top) / rect.height, 0, 1);
+      const sys = state.score.pages[pi].systems[si];
+      if (kind === 'top') {
+        const lim = (sys.dividers[0] != null ? sys.dividers[0] : sys.y1) - 0.01;
+        sys.y0 = clamp(ny, 0, lim);
+      } else if (kind === 'bottom') {
+        const lim = (sys.dividers.length ? sys.dividers[sys.dividers.length - 1] : sys.y0) + 0.01;
+        sys.y1 = clamp(ny, lim, 1);
+      } else if (kind === 'left') {
+        sys.x0 = clamp(nx, 0, sys.x1 - 0.02);
+      } else if (kind === 'right') {
+        sys.x1 = clamp(nx, sys.x0 + 0.02, 1);
+      } else if (kind === 'div') {
+        const lo = (di === 0 ? sys.y0 : sys.dividers[di - 1]) + 0.005;
+        const hi = (di === sys.dividers.length - 1 ? sys.y1 : sys.dividers[di + 1]) - 0.005;
+        sys.dividers[di] = clamp(ny, lo, hi);
+      }
+      renderOverlays(pi);
+    };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  };
+}
+
+function addSystem(pi) {
+  const n = parts().length;
+  const dividers = [];
+  for (let i = 1; i < n; i++) dividers.push(0.34 + 0.32 * (i / n));
+  state.score.pages[pi].systems.push({ y0: 0.34, y1: 0.66, x0: 0.05, x1: 0.95, dividers });
+  renderOverlays(pi);
+}
+function deleteSystem(pi, si) {
+  state.score.pages[pi].systems.splice(si, 1);
+  renderOverlays(pi);
+}
+
+async function handleScoreFile(file) {
+  state.score.file = file; state.score.name = file.name;
+  state.score.busy = true; state.score.outputs = []; state.score.pages = []; state.score.warnings = [];
+  render();
+  await detect();
+}
+async function redetect() {
+  if (!state.score.file) return;
+  state.score.busy = true; state.score.outputs = []; render();
+  await detect();
+}
+async function detect() {
+  try {
+    const fd = new FormData();
+    fd.append('file', state.score.file);
+    fd.append('ensemble', state.ensembleKey);
+    const r = await fetch(API + '/api/detect', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+    state.score.pages = data.pages;
+    state.score.warnings = data.warnings || [];
+    state.score.busy = false;
+    render();
+  } catch (err) {
+    state.score.busy = false; render();
+    alert('Could not detect: ' + err.message);
+  }
+}
+async function extractParts() {
+  const sc = state.score;
+  if (!sc.file || sc.busy) return;
+  sc.busy = true; render();
+  try {
+    const geometry = sc.pages.map(pg => ({ systems: pg.systems }));
+    const fd = new FormData();
+    fd.append('file', sc.file);
+    fd.append('geometry', JSON.stringify(geometry));
+    fd.append('parts', JSON.stringify(parts()));
+    fd.append('title', (sc.name || 'score').replace(/\.pdf$/i, ''));
+    const r = await fetch(API + '/api/extract', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+    sc.outputs = data.parts.map((o, i) => ({ name: o.name, filename: o.filename, dataUrl: o.dataUrl, color: PART_COLORS[i % PART_COLORS.length] }));
+    sc.busy = false; render();
+  } catch (err) {
+    sc.busy = false; render();
+    alert('Extraction failed: ' + err.message);
+  }
+}
+function clearScore() {
+  state.score = { name: '', file: null, pages: [], busy: false, outputs: [], warnings: [] };
+  render();
+}
+
+// ================================================================ IMAGES → PDF
+function renderImg() {
+  const im = state.img;
+  const input = E('input', { attrs: { type: 'file', accept: 'image/png,image/jpeg', multiple: 'multiple' }, css: "display:none;",
+    on: { change: (e) => addImageFiles(e.target.files) } });
+  const drop = E('label', { css: dropZoneCss,
+    on: { drop: (e) => { e.preventDefault(); addImageFiles(e.dataTransfer.files); }, dragover: (e) => e.preventDefault() } }, [
+    input,
+    E('div', { css: "font-family:'Spectral',serif;font-size:18px;", text: 'Drop PNG / JPEG images here' }),
+    E('div', { css: "font-size:13px;color:var(--ink-soft,#7a6c56);", text: "They'll be combined in the order shown — one image per page." }),
+    E('span', { css: "display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:8px;background:var(--accent,#b5532a);color:var(--accent-ink,#fdf6ea);font-weight:600;font-size:13.5px;", text: 'Choose images' }),
+  ]);
+  if (!im.items.length) return E('section', { css: "display:flex;flex-direction:column;gap:22px;" }, drop);
+
+  const sizeSel = E('select', { css: selectCss, on: { change: (e) => { im.pageSize = e.target.value; } } },
+    [['fit-a4','A4 (fit)'],['fit-letter','US Letter (fit)'],['original','Original image size']].map(([k, l]) =>
+      E('option', { attrs: Object.assign({ value: k }, k === im.pageSize ? { selected: 'selected' } : {}), text: l })));
+  const disabled = im.busy || !im.items.length;
+  const makeBtn = E('button', { css: primaryBtn(disabled), attrs: disabled ? { disabled: 'true' } : {},
+    on: { click: () => { if (!disabled) makeImagePdf(); } } }, [spinner(im.busy), im.busy ? 'Building…' : 'Create PDF']);
+
+  const controls = E('div', { css: "display:flex;flex-wrap:wrap;align-items:center;gap:14px;" }, [
+    E('span', { css: "font-size:14px;font-weight:600;", text: im.items.length + ' image(s)' }),
+    E('div', { css: "flex:1;" }),
+    E('div', { css: "display:flex;flex-direction:column;gap:3px;" }, [E('span', { css: labelCapCss, text: 'Page size' }), sizeSel]),
+    E('button', { css: ghostBtn, on: { click: () => { im.items = []; im.output = null; render(); } }, text: 'Clear' }),
+    makeBtn,
+  ]);
+
+  const kids = [controls];
+  if (im.output) {
+    kids.push(E('a', { attrs: { href: im.output.dataUrl, download: im.output.filename },
+      css: "align-self:flex-start;display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:8px;background:var(--panel,#f7f1e3);border:1px solid var(--accent,#b5532a);color:var(--ink,#2c2318);text-decoration:none;font-weight:600;font-size:14px;",
+      text: '✓ Download ' + im.output.filename + ' ↓' }));
+  }
+
+  const grid = E('div', { css: "display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px;" },
+    im.items.map((it, i) => {
+      const thumb = E('div', { style: { position: 'relative', aspectRatio: '1/1', backgroundColor: 'var(--panel-2,#e7dcc4)',
+        backgroundImage: 'url(' + it.dataUrl + ')', backgroundSize: 'contain', backgroundRepeat: 'no-repeat', backgroundPosition: 'center' } },
+        E('span', { css: "position:absolute;top:6px;left:6px;width:24px;height:24px;border-radius:50%;background:var(--accent,#b5532a);color:var(--accent-ink,#fdf6ea);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;", text: String(i + 1) }));
+      const ctrls = E('div', { css: "padding:8px 10px;display:flex;align-items:center;gap:6px;" }, [
+        E('span', { css: "flex:1;font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink-soft,#7a6c56);", text: it.name }),
+        miniBtn('↑', () => moveItem('img', it.id, -1)),
+        miniBtn('↓', () => moveItem('img', it.id, 1)),
+        miniBtn('×', () => removeItem('img', it.id), true),
+      ]);
+      return E('div', { css: "background:var(--panel,#f7f1e3);border:1px solid var(--line,#d8ccb0);border-radius:10px;overflow:hidden;display:flex;flex-direction:column;" }, [thumb, ctrls]);
+    }));
+  kids.push(grid);
+
+  return E('section', { css: "display:flex;flex-direction:column;gap:22px;" }, [drop, E('div', { css: "display:flex;flex-direction:column;gap:20px;" }, kids)]);
+}
+
+function miniBtn(label, fn, accent) {
+  return E('button', { css: "width:26px;height:26px;border:1px solid var(--line,#d8ccb0);border-radius:6px;background:transparent;cursor:pointer;font-size:13px;color:" + (accent ? 'var(--accent,#b5532a)' : 'var(--ink,#2c2318)') + ';',
+    on: { click: fn }, text: label });
+}
+
+async function addImageFiles(fileList) {
+  const files = Array.from(fileList).filter(f => /image\/(png|jpe?g)/.test(f.type));
+  for (const f of files) {
+    const dataUrl = await readDataUrl(f);
+    state.img.items.push({ id: uid(), name: f.name, file: f, dataUrl });
+  }
+  state.img.output = null; render();
+}
+async function makeImagePdf() {
+  const im = state.img;
+  if (!im.items.length || im.busy) return;
+  im.busy = true; render();
+  try {
+    const fd = new FormData();
+    im.items.forEach(it => fd.append('files', it.file, it.name));
+    fd.append('pageSize', im.pageSize);
+    const r = await fetch(API + '/api/images-to-pdf', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+    im.output = { dataUrl: data.dataUrl, filename: data.filename };
+    im.busy = false; render();
+  } catch (err) { im.busy = false; render(); alert('Failed: ' + err.message); }
+}
+
+// ================================================================ MERGE PDFs
+function renderPdf() {
+  const pf = state.pdf;
+  const input = E('input', { attrs: { type: 'file', accept: 'application/pdf', multiple: 'multiple' }, css: "display:none;",
+    on: { change: (e) => addPdfFiles(e.target.files) } });
+  const drop = E('label', { css: dropZoneCss,
+    on: { drop: (e) => { e.preventDefault(); addPdfFiles(e.dataTransfer.files); }, dragover: (e) => e.preventDefault() } }, [
+    input,
+    E('div', { css: "font-family:'Spectral',serif;font-size:18px;", text: 'Drop PDF files here' }),
+    E('div', { css: "font-size:13px;color:var(--ink-soft,#7a6c56);", text: "They'll be merged top-to-bottom into a single PDF." }),
+    E('span', { css: "display:inline-flex;align-items:center;gap:8px;padding:9px 18px;border-radius:8px;background:var(--accent,#b5532a);color:var(--accent-ink,#fdf6ea);font-weight:600;font-size:13.5px;", text: 'Choose PDFs' }),
+  ]);
+  if (!pf.items.length) return E('section', { css: "display:flex;flex-direction:column;gap:22px;" }, drop);
+
+  const totalPages = pf.items.reduce((a, b) => a + (b.pageCount || 0), 0);
+  const disabled = pf.busy || pf.items.length < 1;
+  const mergeBtn = E('button', { css: primaryBtn(disabled), attrs: disabled ? { disabled: 'true' } : {},
+    on: { click: () => { if (!disabled) mergePdfs(); } } }, [spinner(pf.busy), pf.busy ? 'Merging…' : 'Merge PDFs']);
+
+  const controls = E('div', { css: "display:flex;flex-wrap:wrap;align-items:center;gap:14px;" }, [
+    E('span', { css: "font-size:14px;font-weight:600;", text: pf.items.length + ' file(s) · ' + totalPages + ' pages' }),
+    E('div', { css: "flex:1;" }),
+    E('button', { css: ghostBtn, on: { click: () => { pf.items = []; pf.output = null; render(); } }, text: 'Clear' }),
+    mergeBtn,
+  ]);
+
+  const kids = [controls];
+  if (pf.output) {
+    kids.push(E('a', { attrs: { href: pf.output.dataUrl, download: pf.output.filename },
+      css: "align-self:flex-start;display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:8px;background:var(--panel,#f7f1e3);border:1px solid var(--accent,#b5532a);color:var(--ink,#2c2318);text-decoration:none;font-weight:600;font-size:14px;",
+      text: '✓ Download ' + pf.output.filename + ' ↓' }));
+  }
+
+  const list = E('div', { css: "display:flex;flex-direction:column;gap:10px;" },
+    pf.items.map((it, i) => E('div', { css: "display:flex;align-items:center;gap:14px;padding:14px 16px;background:var(--panel,#f7f1e3);border:1px solid var(--line,#d8ccb0);border-radius:10px;" }, [
+      E('span', { css: "width:30px;height:30px;border-radius:7px;background:var(--accent,#b5532a);color:var(--accent-ink,#fdf6ea);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;", text: String(i + 1) }),
+      E('div', { css: "width:34px;height:42px;border-radius:4px;background:var(--panel-2,#e7dcc4);border:1px solid var(--line,#d8ccb0);display:flex;align-items:flex-end;justify-content:center;font-size:9px;color:var(--ink-soft,#7a6c56);padding-bottom:3px;", text: 'PDF' }),
+      E('div', { css: "flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;" }, [
+        E('span', { css: "font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;", text: it.name }),
+        E('span', { css: "font-size:12px;color:var(--ink-soft,#7a6c56);", text: (it.pageCount != null ? it.pageCount : '…') + ' page(s)' }),
+      ]),
+      bigBtn('↑', () => moveItem('pdf', it.id, -1)),
+      bigBtn('↓', () => moveItem('pdf', it.id, 1)),
+      bigBtn('×', () => removeItem('pdf', it.id), true),
+    ])));
+  kids.push(list);
+
+  return E('section', { css: "display:flex;flex-direction:column;gap:22px;" }, [drop, E('div', { css: "display:flex;flex-direction:column;gap:18px;" }, kids)]);
+}
+
+function bigBtn(label, fn, accent) {
+  return E('button', { css: "width:30px;height:30px;border:1px solid var(--line,#d8ccb0);border-radius:6px;background:transparent;cursor:pointer;font-size:" + (accent ? '16px' : '14px') + ";color:" + (accent ? 'var(--accent,#b5532a)' : 'var(--ink,#2c2318)') + ';',
+    on: { click: fn }, text: label });
+}
+
+async function addPdfFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.type === 'application/pdf' || /\.pdf$/i.test(f.name));
+  const newItems = files.map(f => ({ id: uid(), name: f.name, file: f, pageCount: null }));
+  state.pdf.items.push(...newItems);
+  state.pdf.output = null; render();
+  // fetch page counts
+  try {
+    const fd = new FormData();
+    files.forEach(f => fd.append('files', f, f.name));
+    const r = await fetch(API + '/api/pdf-info', { method: 'POST', body: fd });
+    if (r.ok) {
+      const data = await r.json();
+      data.files.forEach((info, idx) => { if (newItems[idx]) newItems[idx].pageCount = info.pageCount; });
+      render();
+    }
+  } catch (e) { /* counts are best-effort */ }
+}
+async function mergePdfs() {
+  const pf = state.pdf;
+  if (pf.items.length < 1 || pf.busy) return;
+  pf.busy = true; render();
+  try {
+    const fd = new FormData();
+    pf.items.forEach(it => fd.append('files', it.file, it.name));
+    const r = await fetch(API + '/api/merge-pdfs', { method: 'POST', body: fd });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const data = await r.json();
+    pf.output = { dataUrl: data.dataUrl, filename: data.filename };
+    pf.busy = false; render();
+  } catch (err) { pf.busy = false; render(); alert('Merge failed: ' + err.message); }
+}
+
+// ---------------------------------------------------------------- list ops
+function moveItem(which, id, dir) {
+  const arr = state[which].items;
+  const i = arr.findIndex(x => x.id === id);
+  const j = i + dir;
+  if (i < 0 || j < 0 || j >= arr.length) return;
+  [arr[i], arr[j]] = [arr[j], arr[i]];
+  render();
+}
+function removeItem(which, id) {
+  state[which].items = state[which].items.filter(x => x.id !== id);
+  render();
+}
+
+// ---------------------------------------------------------------- boot
+async function pingEngine() {
+  try {
+    const r = await fetch(API + '/api/health', { cache: 'no-store' });
+    state.engine = r.ok ? 'ready' : 'off';
+  } catch (e) { state.engine = 'off'; }
+  render();
+}
+render();
+pingEngine();
+setInterval(pingEngine, 15000);
+</script>
+</body>
+</html>
